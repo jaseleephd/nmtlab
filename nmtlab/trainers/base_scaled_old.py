@@ -25,30 +25,28 @@ from nmtlab.dataset import MTDataset
 from nmtlab.schedulers import Scheduler
 from nmtlab.utils import OPTS
 
-import higher
-
 ROOT_RANK = 0
+
 
 class TrainerKit(object):
     """Training NMT models.
     """
-
+    
     __metaclass__ = ABCMeta
-
-    def __init__(self, model, dataset, optimizers, scheduler=None, multigpu=False, using_horovod=True):
+    
+    def __init__(self, model, dataset, optimizer, scheduler=None, multigpu=False, using_horovod=True):
         """Create a trainer.
         Args:
             model (EncoderDecoderModel): The model to train.
             dataset (MTDataset): Bilingual dataset.
+            optimizer (Optimizer): Torch optimizer.
             scheduler (Scheduler): Training scheduler.
         """
         self.enc_param_names = ["embed_layer", "x_encoder", "q_encoder", "q_hid2lat"]
         self.kl_grad, self.nll_grad, self.total_grad, self.param_norm = {}, {}, {}, {}
         self._model = model
         self._dataset = dataset
-        self.inner_optimizer = optimizers[0]
-        self.outer_optimizer = optimizers[1]
-        self._optimizer  = self.outer_optimizer
+        self._optimizer = optimizer
         self._scheduler = scheduler if scheduler is not None else Scheduler()
         self._multigpu = multigpu
         self._horovod = using_horovod
@@ -131,14 +129,13 @@ class TrainerKit(object):
         else:
             self._model = model
 
-    def configure(self, save_path=None, clip_norm=0, outer_lr=0.0,  n_valid_per_epoch=10, criteria="loss",
+    def configure(self, save_path=None, clip_norm=0, n_valid_per_epoch=10, criteria="loss",
                   comp_fn=min, checkpoint_average=0,
                   tensorboard_logdir=None, tensorboard_namespace=None):
         """Configure the hyperparameters of the trainer.
         """
         self._save_path = save_path
         self._clip_norm = clip_norm
-        self.outer_lr = outer_lr
         self._n_valid_per_epoch = n_valid_per_epoch
         self._criteria = criteria
         self._comp_fn = comp_fn
@@ -210,49 +207,33 @@ class TrainerKit(object):
         return kl.item(), nll.item(), total.item(), param.item()
 
     def train(self, batch):
+        """Run one forward and backward step with given batch.
+        """
+        self._optimizer.zero_grad()
         vars = self.extract_vars(batch)
-        lr = self.inner_optimizer.param_groups[0]["lr"]
-
-        with higher.innerloop_ctx(self._model, self.inner_optimizer) as (fmodel, diffopt):
-            val_map = fmodel(*vars)
-            diffopt.step(val_map["nll"])
-            val_map = fmodel(*vars)
-            diffopt.step(val_map["kl"])
-
-            norm_grad_diff = 0.0
-            for p0, p1, p2 in zip(
-                fmodel._fast_params[0],
-                fmodel._fast_params[1],
-                fmodel._fast_params[2],
-            ):
-                nll_grad = (p1 - p0) / lr
-                kl_grad = (p2 - p1) / lr
-                if kl_grad.sum().item() != 0:
-                    norm_grad_diff += ( (nll_grad - kl_grad) ** 2 ).sum()
-
-            norm_grad_diff = norm_grad_diff.sqrt()
-
-            grad_of_grads = torch.autograd.grad(norm_grad_diff, fmodel.init_fast_params, allow_unused=True)
-            if self._clip_norm > 0:
-                real_grad_of_grads = [g for g in grad_of_grads if not g is None]
-                total_norm = torch.norm(
-                    torch.stack([torch.norm(g.detach()) for g in real_grad_of_grads]))
-                clip_coef = self._clip_norm / (total_norm + 1e-6)
-                if clip_coef < 1:
-                    for g in grad_of_grads:
-                        if not g is None:
-                            g.mul_(clip_coef)
-
-        self.outer_optimizer.zero_grad()
         val_map = self._model(*vars)
-        val_map["loss"].backward()
+        if self._multigpu and not self._horovod:
+            for k, v in val_map.items():
+                val_map[k] = v.mean()
+        if not OPTS.shard:
+            self.kl_grad, self.nll_grad, self.total_grad, self.param_norm = {}, {}, {}, {}
+            val_map["nll"].backward(retain_graph=True)
+            for name, param in self._model.named_parameters():
+                if any([name.startswith(xx) for xx in self.enc_param_names]):
+                    self.param_norm[name] = param.data.clone()
+                    self.nll_grad[name] = param.grad.data.clone()
+
+            val_map["kl"].backward(retain_graph=False)
+            for name, param in self._model.named_parameters():
+                if any([name.startswith(xx) for xx in self.enc_param_names]):
+                    self.total_grad[name] = param.grad.data.clone()
+                    self.kl_grad[name] = param.grad.data.clone() - self.nll_grad[name]
 
         if self._clip_norm > 0:
+            # if self._multigpu and self._horovod:
+            #     self._optimizer.synchronize()
             torch.nn.utils.clip_grad_norm_(self._model.parameters(), self._clip_norm)
-        self.outer_optimizer.step()
-        for grad, param in zip(grad_of_grads, self._model.parameters()):
-            if not grad is None:
-                param.data.add_(grad, alpha=self.outer_lr)
+        self._optimizer.step()
         self.print_progress(val_map)
         self.record_train_scores(val_map)
         self._global_step += 1
@@ -262,7 +243,6 @@ class TrainerKit(object):
                     self._train_writer.add_scalar(
                         "{}/{}".format(self._tensorboard_namespace, key), val.item(), self._global_step)
 
-            """
             kl, nll, total, param = self.get_grads()
             self._train_writer.add_scalar(
                 "{}/{}".format(self._tensorboard_namespace, "kl_grad_norm"), kl, self._global_step)
@@ -272,7 +252,6 @@ class TrainerKit(object):
                 "{}/{}".format(self._tensorboard_namespace, "total_grad_norm"), total, self._global_step)
             self._train_writer.add_scalar(
                 "{}/{}".format(self._tensorboard_namespace, "param_norm"), param, self._global_step)
-            """
         return val_map
 
     def valid(self, force=False):
@@ -366,12 +345,12 @@ class TrainerKit(object):
         progress = int(float(self._current_step) / self._n_train_batch * 100)
         speed = float(self._current_step * self._batch_size) / (time.time() - self._begin_time) * self._n_devices
         unit = "token" if self._dataset.batch_type() == "token" else "batch"
-        #sys.stdout.write("[epoch {}|{}%] elbo={:.2f} | {:.1f} {}/s   \r".format(
-        #    self._current_epoch + 1, progress, val_map["elbo"], speed, unit,
-        #))
-        sys.stdout.write("[epoch {}|{}%] elbo={:.2f} | kl {:.2f} nll {:.2f} {:.1f} {}/s   \r".format(
-            self._current_epoch + 1, progress, val_map["elbo"], val_map["kl"], val_map["nll"], speed, unit,
+        sys.stdout.write("[epoch {}|{}%] elbo={:.2f} | {:.1f} {}/s   \r".format(
+            self._current_epoch + 1, progress, val_map["elbo"], speed, unit,
         ))
+        #sys.stdout.write("[epoch {}|{}%] elbo={:.2f} | kl {:.2f} nll {:.2f} {:.1f} {}/s   \r".format(
+        #    self._current_epoch + 1, progress, val_map["elbo"], kl, nll, speed, unit,
+        #))
         sys.stdout.flush()
     
     def log(self, who, msg):
