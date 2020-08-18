@@ -231,50 +231,64 @@ class TrainerKit(object):
         inner_lr = self.inner_optimizer.param_groups[0]["lr"]
 
         if (self._global_step < self._match_gradnorm_iter) or (self._global_step < self._minimize_cosine_iter):
-            with higher.innerloop_ctx(self._model, self.inner_optimizer) as (fmodel, diffopt):
-                if self._current_epoch % 2 == 0:
-                    inner_vars = [vars[0][::2], vars[1][::2]]
-                else:
-                    inner_vars = [vars[0][1::2], vars[1][1::2]]
-                val_map = fmodel(*inner_vars)
-                diffopt.step(val_map["nll"])
-                val_map = fmodel(*inner_vars)
-                diffopt.step(val_map["kl"])
+            fmodel = higher.patch.monkeypatch(self._model)
+            if self._current_epoch % 2 == 0:
+                inner_vars = [vars[0][::2], vars[1][::2]]
+            #elif self._current_epoch % 3 == 1:
+            #    inner_vars = [vars[0][1::3], vars[1][1::3]]
+            else:
+                inner_vars = [vars[0][1::2], vars[1][1::2]]
+            val_map = fmodel(*inner_vars)
 
-                norm_grad_diff = 0.0
-                dot, norm1, norm2 = 0.0, 0.0, 0.0
-                for p0, p1, p2 in zip(
-                    fmodel._fast_params[0],
-                    fmodel._fast_params[1],
-                    fmodel._fast_params[2],
-                ):
-                    nll_grad = (p1 - p0) / inner_lr
-                    kl_grad = (p2 - p1) / inner_lr
-                    if self._global_step < self._match_gradnorm_iter:
-                        if kl_grad.sum().item() != 0:
-                            norm_grad_diff += ( (nll_grad - kl_grad) ** 2 ).sum()
-                    else:
-                        dot += (nll_grad * kl_grad).sum()
-                        norm1 += (nll_grad ** 2).sum()
-                        norm2 += (kl_grad ** 2).sum()
+            self.kl_grad, self.nll_grad = {}, {}
+            nll_norm, kl_norm = 0.0, 0.0
 
-                if self._global_step < self._match_gradnorm_iter:
-                    norm_grad_diff = norm_grad_diff.sqrt()
-                else:
-                    norm_grad_diff = dot / ( norm1.sqrt() * norm2.sqrt() )
+            #val_map["kl"].backward(retain_graph=True, create_graph=False)
+            kl_grads = torch.autograd.grad(
+                val_map["kl"], fmodel.init_fast_params, retain_graph=True, create_graph=True, allow_unused=True)
+            for kl_grad in kl_grads:
+                if not kl_grad is None:
+                    kl_norm += (kl_grad ** 2).sum()
+            #for name, param in fmodel.named_parameters():
+            #    if any([name.startswith(xx) for xx in self.enc_param_names]):
+            #        self.kl_grad[name] = param.grad
+            #        kl_norm += (self.kl_grad[name] ** 2).sum()
 
-                grad_of_grads = torch.autograd.grad(norm_grad_diff, fmodel.init_fast_params, allow_unused=True)
-                if self._clip_norm > 0:
-                    real_grad_of_grads = [g for g in grad_of_grads if not g is None]
-                    total_norm = torch.norm(
-                        torch.stack([torch.norm(g.detach()) for g in real_grad_of_grads]))
-                    clip_coef = self._clip_norm / (total_norm + 1e-6)
-                    if clip_coef > 1:
-                        clip_coef = 1
+            #val_map["nll"].backward(retain_graph=True, create_graph=False)
+            nll_grads = torch.autograd.grad(
+                val_map["nll"], fmodel.init_fast_params, allow_unused=True, create_graph=True)
+            for nll_grad in nll_grads:
+                if not nll_grad is None:
+                    nll_norm += (nll_grad ** 2).sum()
+            #for name, param in fmodel.named_parameters():
+            #    if any([name.startswith(xx) for xx in self.enc_param_names]):
+            #        self.nll_grad[name] = param.grad - self.kl_grad[name]
+            #        nll_norm += (self.nll_grad[name] ** 2).sum()
 
+            norm_grad_diff = (nll_norm - kl_norm) ** 2
+            grad_of_grads = torch.autograd.grad(
+                norm_grad_diff, fmodel.init_fast_params, allow_unused=True)
+            #self.kl_grad, self.nll_grad = {}, {}
+            #nll_norm, kl_norm = 0.0, 0.0
+            #norm_grad_diff = 0.0
+
+            if self._clip_norm > 0:
+                real_grad_of_grads = [g for g in grad_of_grads if not g is None]
+                total_norm = torch.norm(
+                    torch.stack([torch.norm(g.detach()) for g in real_grad_of_grads]))
+                clip_coef = self._clip_norm / (total_norm + 1e-6)
+                if clip_coef > 1:
+                    clip_coef = 1
+
+            for grad, param in zip(grad_of_grads, self._model.parameters()):
+                if not grad is None:
+                    param.data.add_(grad, alpha=-1.0 * self._matchnorm_lr * clip_coef)
+                    param.grad = None
+
+        self.inner_optimizer.zero_grad()
         self.outer_optimizer.zero_grad()
+        torch.cuda.empty_cache()
         val_map = self._model(*vars)
-
         # case 1) matching norm of the gradient differences
         #   monitor the gradients here
         # case 2) scaling norm of KL gradient, so that it's at most the norm of the NLL gradient
@@ -326,17 +340,13 @@ class TrainerKit(object):
                 "{}/{}".format(self._tensorboard_namespace, "param_norm"), param, self._global_step)
             if self._global_step < self._match_gradnorm_iter:
                 self._train_writer.add_scalar(
-                    "{}/{}".format(self._tensorboard_namespace, "norm_grad_diff"), norm_grad_diff.item(), self._global_step)
+                    "{}/{}".format(self._tensorboard_namespace, "norm_grad_diff"), norm_grad_diff, self._global_step)
 
         if self._global_step % 100 != 0:
             if self._clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(self._model.parameters(), self._clip_norm)
             self.outer_optimizer.step()
 
-        if (self._global_step < self._match_gradnorm_iter) or (self._global_step < self._minimize_cosine_iter):
-            for grad, param in zip(grad_of_grads, self._model.parameters()):
-                if not grad is None:
-                    param.data.add_(grad, alpha=-1.0 * self._matchnorm_lr * clip_coef)
         self.print_progress(val_map)
         self.record_train_scores(val_map)
         self._global_step += 1
