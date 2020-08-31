@@ -30,7 +30,7 @@ import higher
 
 ROOT_RANK = 0
 
-class TrainerKit(object):
+class TrainerKitFisher(object):
     """Training NMT models.
     """
 
@@ -136,7 +136,6 @@ class TrainerKit(object):
                   scale_klgrad_iter=-1, match_gradnorm_iter=-1, kl_annealing=False,
                   scale_klgrad_only_smaller=False, minimize_cosine_iter=-1,
                   minimize_inter_iter=-1, eps2=0.0,
-                  opt_type="gradient",
                   n_valid_per_epoch=10, criteria="loss",
                   comp_fn=min, checkpoint_average=0,
                   tensorboard_logdir=None, tensorboard_namespace=None):
@@ -147,7 +146,6 @@ class TrainerKit(object):
         self._matchnorm_lr = matchnorm_lr
         self._minimize_cosine_iter = minimize_cosine_iter
         self._minimize_inter_iter = minimize_inter_iter
-        self._opt_type = opt_type
         self.eps2 = eps2
         self._scale_klgrad_iter = scale_klgrad_iter
         self._scale_klgrad_only_smaller = scale_klgrad_only_smaller
@@ -240,26 +238,31 @@ class TrainerKit(object):
         kl_grads = torch.autograd.grad(
             val_map["kl"], self._model.parameters(), retain_graph=True, allow_unused=True)
         nll_grads = torch.autograd.grad(
-            val_map["nll"] + val_map["len_loss"], self._model.parameters(), allow_unused=True)
-        if self._opt_type == "fisher":
-            nll_sample_grads = torch.autograd.grad(
-                val_map["nll_sample"] + val_map["len_loss"], self._model.parameters(), allow_unused=True)
+            val_map["nll"] + val_map["len_loss"], self._model.parameters(), retain_graph=True, allow_unused=True)
+        nll_sample_grads = torch.autograd.grad(
+            val_map["nll_sample"] + val_map["len_loss"], self._model.parameters(), allow_unused=True)
 
-        nll_norm, kl_norm = 0.0, 0.0
-        for nll_grad, kl_grad in zip(nll_grads, kl_grads):
+        nll_norm, nll_sample_norm, kl_norm = 0.0, 0.0, 0.0
+        for nll_grad, nll_sample_grad, kl_grad in zip(nll_grads, nll_sample_grads, kl_grads):
             if not kl_grad is None:
                 kl_norm += (kl_grad ** 2).sum()
             if not nll_grad is None:
                 nll_norm += (nll_grad ** 2).sum()
+            if not nll_sample_grad is None:
+                nll_sample_norm += (nll_sample_grad ** 2).sum()
         nll_norm = nll_norm.sqrt()
+        nll_sample_norm = nll_sample_norm.sqrt()
         kl_norm = kl_norm.sqrt()
 
-        if self._clip_norm > 0 and (nll_norm > self._clip_norm or kl_norm > self._clip_norm):
-            for nll_grad, kl_grad in zip(nll_grads, kl_grads):
+        if self._clip_norm > 0 and (
+            nll_norm > self._clip_norm or nll_sample_norm > self._clip_norm or kl_norm > self._clip_norm):
+            for nll_grad, nll_sample_grad, kl_grad in zip(nll_grads, nll_sample_grads, kl_grads):
                 if not kl_grad is None and kl_norm > self._clip_norm:
                     kl_grad.mul_( self._clip_norm / (kl_norm + 1e-6) )
                 if not nll_grad is None and nll_norm > self._clip_norm:
                     nll_grad.mul_( self._clip_norm / (nll_norm + 1e-6))
+                if not nll_sample_grad is None and nll_sample_norm > self._clip_norm:
+                    nll_sample_grad.mul_( self._clip_norm / (nll_sample_norm + 1e-6))
 
         param_norm = 0.0
         for p in self._model.parameters():
@@ -274,8 +277,8 @@ class TrainerKit(object):
             self._train_writer.add_scalar(
                 "{}/{}".format(self._tensorboard_namespace, "param_norm"), param_norm.item(), self._global_step)
 
-        self.opt_kl.step(gradients=kl_grads)
-        self.opt_nll.step(gradients=nll_grads, prec_gradients=nll_prec_gradients)
+        self.opt_kl.step1(gradients=kl_grads)
+        self.opt_nll.step2(gradients=nll_grads, prec_gradients=nll_sample_grads)
 
         self.print_progress(val_map)
         self.record_train_scores(val_map)

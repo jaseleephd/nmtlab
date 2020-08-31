@@ -30,7 +30,7 @@ import higher
 
 ROOT_RANK = 0
 
-class TrainerKit(object):
+class TrainerKitGradient(object):
     """Training NMT models.
     """
 
@@ -136,7 +136,6 @@ class TrainerKit(object):
                   scale_klgrad_iter=-1, match_gradnorm_iter=-1, kl_annealing=False,
                   scale_klgrad_only_smaller=False, minimize_cosine_iter=-1,
                   minimize_inter_iter=-1, eps2=0.0,
-                  opt_type="gradient",
                   n_valid_per_epoch=10, criteria="loss",
                   comp_fn=min, checkpoint_average=0,
                   tensorboard_logdir=None, tensorboard_namespace=None):
@@ -147,7 +146,6 @@ class TrainerKit(object):
         self._matchnorm_lr = matchnorm_lr
         self._minimize_cosine_iter = minimize_cosine_iter
         self._minimize_inter_iter = minimize_inter_iter
-        self._opt_type = opt_type
         self.eps2 = eps2
         self._scale_klgrad_iter = scale_klgrad_iter
         self._scale_klgrad_only_smaller = scale_klgrad_only_smaller
@@ -241,9 +239,6 @@ class TrainerKit(object):
             val_map["kl"], self._model.parameters(), retain_graph=True, allow_unused=True)
         nll_grads = torch.autograd.grad(
             val_map["nll"] + val_map["len_loss"], self._model.parameters(), allow_unused=True)
-        if self._opt_type == "fisher":
-            nll_sample_grads = torch.autograd.grad(
-                val_map["nll_sample"] + val_map["len_loss"], self._model.parameters(), allow_unused=True)
 
         nll_norm, kl_norm = 0.0, 0.0
         for nll_grad, kl_grad in zip(nll_grads, kl_grads):

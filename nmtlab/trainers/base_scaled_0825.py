@@ -47,9 +47,9 @@ class TrainerKit(object):
         self.kl_grad, self.nll_grad, self.total_grad, self.param_norm = {}, {}, {}, {}
         self._model = model
         self._dataset = dataset
-        self.opt_kl = optimizers[0]
-        self.opt_nll = optimizers[1]
-        self._optimizer  = self.opt_nll
+        self.p_opt = optimizers[0]
+        self.q_opt = optimizers[1]
+        self._optimizer  = self.q_opt
         self._scheduler = scheduler if scheduler is not None else Scheduler()
         self._multigpu = multigpu
         self._horovod = using_horovod
@@ -136,7 +136,6 @@ class TrainerKit(object):
                   scale_klgrad_iter=-1, match_gradnorm_iter=-1, kl_annealing=False,
                   scale_klgrad_only_smaller=False, minimize_cosine_iter=-1,
                   minimize_inter_iter=-1, eps2=0.0,
-                  opt_type="gradient",
                   n_valid_per_epoch=10, criteria="loss",
                   comp_fn=min, checkpoint_average=0,
                   tensorboard_logdir=None, tensorboard_namespace=None):
@@ -147,7 +146,6 @@ class TrainerKit(object):
         self._matchnorm_lr = matchnorm_lr
         self._minimize_cosine_iter = minimize_cosine_iter
         self._minimize_inter_iter = minimize_inter_iter
-        self._opt_type = opt_type
         self.eps2 = eps2
         self._scale_klgrad_iter = scale_klgrad_iter
         self._scale_klgrad_only_smaller = scale_klgrad_only_smaller
@@ -232,50 +230,92 @@ class TrainerKit(object):
     def train(self, batch):
         vars = self.extract_vars(batch)
 
-        self.opt_kl.zero_grad()
-        self.opt_nll.zero_grad()
+        if (self._global_step < self._match_gradnorm_iter) or (self._global_step < self._minimize_inter_iter):
+            fmodel = higher.patch.monkeypatch(self._model)
+            val_map = fmodel(*vars)
+
+            kl_grads = torch.autograd.grad(
+                val_map["kl"], fmodel.init_fast_params, retain_graph=True, create_graph=True, allow_unused=True)
+            nll_grads = torch.autograd.grad(
+                val_map["nll"], fmodel.init_fast_params, allow_unused=True, create_graph=True)
+
+            nll_norm, kl_norm, dot, grad_diff = 0.0, 0.0, 0.0, 0.0
+            for nll_grad, kl_grad in zip(nll_grads, kl_grads):
+                if not kl_grad is None:
+                    kl_norm += (kl_grad ** 2).sum()
+                    nll_norm += (nll_grad ** 2).sum()
+                    dot += (nll_grad * kl_grad).sum()
+                    grad_diff_ = torch.max(kl_grad, nll_grad) - torch.min(kl_grad, nll_grad)
+                    grad_diff += torch.max(grad_diff_, torch.full_like(grad_diff_, self.eps2)).sum()
+
+            norm_grad_diff = (nll_norm - kl_norm) ** 2
+            cosine_sim = dot / (nll_norm.sqrt() * kl_norm.sqrt())
+            if self._global_step < self._match_gradnorm_iter:
+                grad_of_grads = torch.autograd.grad(
+                    norm_grad_diff, fmodel.init_fast_params, allow_unused=True)
+            if self._global_step < self._minimize_inter_iter:
+                grad_of_grads = torch.autograd.grad(
+                    grad_diff, fmodel.init_fast_params, allow_unused=True)
+
+            clip_coef = 1.0
+            if self._clip_norm > 0:
+                real_grad_of_grads = [g for g in grad_of_grads if not g is None]
+                total_norm = torch.norm(
+                    torch.stack([torch.norm(g.detach()) for g in real_grad_of_grads]))
+                clip_coef = self._clip_norm / (total_norm + 1e-6)
+                if clip_coef > 1:
+                    clip_coef = 1.0
+
+            for grad, param in zip(grad_of_grads, self._model.parameters()):
+                if not grad is None:
+                    param.data.add_(grad, alpha=-1.0 * self._matchnorm_lr * clip_coef)
+
+        self.q_opt.zero_grad()
         torch.cuda.empty_cache()
         val_map = self._model(*vars)
 
-        kl_grads = torch.autograd.grad(
-            val_map["kl"], self._model.parameters(), retain_graph=True, allow_unused=True)
-        nll_grads = torch.autograd.grad(
-            val_map["nll"] + val_map["len_loss"], self._model.parameters(), allow_unused=True)
-        if self._opt_type == "fisher":
-            nll_sample_grads = torch.autograd.grad(
-                val_map["nll_sample"] + val_map["len_loss"], self._model.parameters(), allow_unused=True)
+        if (self._global_step % 100 == 0):
+            kl_grads = torch.autograd.grad(
+                val_map["kl"], self._model.parameters(), retain_graph=True, allow_unused=True)
+            nll_grads = torch.autograd.grad(
+                val_map["nll"], self._model.parameters(), allow_unused=True)
 
-        nll_norm, kl_norm = 0.0, 0.0
-        for nll_grad, kl_grad in zip(nll_grads, kl_grads):
-            if not kl_grad is None:
-                kl_norm += (kl_grad ** 2).sum()
-            if not nll_grad is None:
-                nll_norm += (nll_grad ** 2).sum()
-        nll_norm = nll_norm.sqrt()
-        kl_norm = kl_norm.sqrt()
-
-        if self._clip_norm > 0 and (nll_norm > self._clip_norm or kl_norm > self._clip_norm):
+            nll_norm, kl_norm, dot, grad_diff = 0.0, 0.0, 0.0, 0.0
             for nll_grad, kl_grad in zip(nll_grads, kl_grads):
-                if not kl_grad is None and kl_norm > self._clip_norm:
-                    kl_grad.mul_( self._clip_norm / (kl_norm + 1e-6) )
-                if not nll_grad is None and nll_norm > self._clip_norm:
-                    nll_grad.mul_( self._clip_norm / (nll_norm + 1e-6))
+                if not kl_grad is None:
+                    kl_norm += (kl_grad ** 2).sum()
+                    nll_norm += (nll_grad ** 2).sum()
+                    dot += (nll_grad * kl_grad).sum()
+                    grad_diff += ( torch.max(kl_grad, nll_grad) - torch.min(kl_grad, nll_grad) ).sum()
 
-        param_norm = 0.0
-        for p in self._model.parameters():
-            param_norm += (p.data ** 2).sum()
-        param_norm = param_norm.sqrt()
+            param_norm = 0.0
+            for p in self._model.parameters():
+                param_norm += (p.data ** 2).sum()
+            param_norm = param_norm.sqrt()
+
+            norm_grad_diff_ = (nll_norm - kl_norm) ** 2
+            cosine_sim_ = dot / (nll_norm.sqrt() * kl_norm.sqrt())
+        else:
+            val_map["loss"].backward()
 
         if self._global_step % 100 == 0:
+            self._train_writer.add_scalar(
+                "{}/{}".format(self._tensorboard_namespace, "cosine"), cosine_sim_.item(), self._global_step)
             self._train_writer.add_scalar(
                 "{}/{}".format(self._tensorboard_namespace, "kl_grad_norm"), kl_norm.item(), self._global_step)
             self._train_writer.add_scalar(
                 "{}/{}".format(self._tensorboard_namespace, "nll_grad_norm"), nll_norm.item(), self._global_step)
             self._train_writer.add_scalar(
+                "{}/{}".format(self._tensorboard_namespace, "diff_grad_norm"), norm_grad_diff_.item(), self._global_step)
+            self._train_writer.add_scalar(
                 "{}/{}".format(self._tensorboard_namespace, "param_norm"), param_norm.item(), self._global_step)
+            self._train_writer.add_scalar(
+                "{}/{}".format(self._tensorboard_namespace, "grad_diff"), grad_diff.item(), self._global_step)
 
-        self.opt_kl.step(gradients=kl_grads)
-        self.opt_nll.step(gradients=nll_grads, prec_gradients=nll_prec_gradients)
+        if self._global_step % 100 != 0:
+            if self._clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(self._model.parameters(), self._clip_norm)
+            self.q_opt.step()
 
         self.print_progress(val_map)
         self.record_train_scores(val_map)
@@ -402,8 +442,8 @@ class TrainerKit(object):
             "step": self._current_step,
             "global_step": self._global_step,
             "model_state": self._model.state_dict(),
-            "kl_opt_state": self.opt_kl.state_dict(),
-            "nll_opt_state": self.opt_nll.state_dict(),
+            "p_opt_state": self.p_opt.state_dict(),
+            "q_opt_state": self.q_opt.state_dict(),
             "leanring_rate": self.learning_rate()
         }
         if path is None:
@@ -419,8 +459,8 @@ class TrainerKit(object):
         device_str = str(first_param.device)
         state_dict = torch.load(path, map_location=device_str)
         self._model.load_state_dict(state_dict["model_state"])
-        self.opt_kl.load_state_dict(state_dict["kl_opt_state"])
-        self.opt_nll.load_state_dict(state_dict["nll_opt_state"])
+        self.p_opt.load_state_dict(state_dict["p_opt_state"])
+        self.q_opt.load_state_dict(state_dict["q_opt_state"])
         self._current_step = state_dict["step"]
         self._current_epoch = state_dict["epoch"]
         if "global_step" in state_dict:
@@ -443,7 +483,7 @@ class TrainerKit(object):
             return is_finished
     
     def learning_rate(self):
-        return self.opt_kl.param_groups[0]["lr"]
+        return self.q_opt.param_groups[0]["lr"]
     
     def synchronize_learning_rate(self):
         """Synchronize learning rate over all devices.
@@ -457,9 +497,7 @@ class TrainerKit(object):
                 self.set_learning_rate(new_lr, silent=True)
         
     def set_learning_rate(self, lr, silent=False):
-        for g in self.opt_kl.param_groups:
-            g["lr"] = lr
-        for g in self.opt_nll.param_groups:
+        for g in self.q_opt.param_groups:
             g["lr"] = lr
         if self._is_root_node() and not silent:
             self.log("nmtlab", "change learning rate to {:.6f}".format(lr))

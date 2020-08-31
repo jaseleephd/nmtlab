@@ -30,7 +30,7 @@ import higher
 
 ROOT_RANK = 0
 
-class TrainerKit(object):
+class TrainerKitHessian(object):
     """Training NMT models.
     """
 
@@ -136,7 +136,6 @@ class TrainerKit(object):
                   scale_klgrad_iter=-1, match_gradnorm_iter=-1, kl_annealing=False,
                   scale_klgrad_only_smaller=False, minimize_cosine_iter=-1,
                   minimize_inter_iter=-1, eps2=0.0,
-                  opt_type="gradient",
                   n_valid_per_epoch=10, criteria="loss",
                   comp_fn=min, checkpoint_average=0,
                   tensorboard_logdir=None, tensorboard_namespace=None):
@@ -147,7 +146,6 @@ class TrainerKit(object):
         self._matchnorm_lr = matchnorm_lr
         self._minimize_cosine_iter = minimize_cosine_iter
         self._minimize_inter_iter = minimize_inter_iter
-        self._opt_type = opt_type
         self.eps2 = eps2
         self._scale_klgrad_iter = scale_klgrad_iter
         self._scale_klgrad_only_smaller = scale_klgrad_only_smaller
@@ -237,29 +235,61 @@ class TrainerKit(object):
         torch.cuda.empty_cache()
         val_map = self._model(*vars)
 
-        kl_grads = torch.autograd.grad(
-            val_map["kl"], self._model.parameters(), retain_graph=True, allow_unused=True)
-        nll_grads = torch.autograd.grad(
-            val_map["nll"] + val_map["len_loss"], self._model.parameters(), allow_unused=True)
-        if self._opt_type == "fisher":
-            nll_sample_grads = torch.autograd.grad(
-                val_map["nll_sample"] + val_map["len_loss"], self._model.parameters(), allow_unused=True)
+        kl_grads = torch.autograd.grad(val_map["kl"], self._model.parameters(),
+                                       create_graph=True, retain_graph=True, allow_unused=True)
+        nll_grads = torch.autograd.grad(val_map["nll"] + val_map["len_loss"], self._model.parameters(),
+                                        create_graph=True, retain_graph=True, allow_unused=True)
+        kl_zs = [None if kl_grad is None else \
+                 torch.randint_like(kl_grad, low=0, high=2).float() * 2.0 - 1 for kl_grad in kl_grads]
+        nll_zs = [None if nll_grad is None else \
+                  torch.randint_like(nll_grad, low=0, high=2).float() * 2.0 - 1 for nll_grad in nll_grads]
 
-        nll_norm, kl_norm = 0.0, 0.0
-        for nll_grad, kl_grad in zip(nll_grads, kl_grads):
+        gz_kl, gz_nll = 0.0, 0.0
+        for kl_grad, kl_z, nll_grad, nll_z in zip(kl_grads, kl_zs, nll_grads, nll_zs):
             if not kl_grad is None:
-                kl_norm += (kl_grad ** 2).sum()
+                gz_kl += (kl_grad * kl_z).sum()
+            if not nll_grad is None:
+                gz_nll += (nll_grad * nll_z).sum()
+
+        kl_hessians = torch.autograd.grad(
+            gz_kl, self._model.parameters(), retain_graph=True, allow_unused=True)
+        nll_hessians = torch.autograd.grad(
+            gz_nll, self._model.parameters(), allow_unused=True)
+
+        for kl_hessian, kl_z, nll_hessian, nll_z in zip(kl_hessians, kl_zs, nll_hessians, nll_zs):
+            if not kl_hessian is None:
+                kl_hessian.mul_(kl_z)
+            if not nll_hessian is None:
+                nll_hessian.mul_(nll_z)
+
+        nll_norm, nll2_norm, kl_norm, kl2_norm = 0.0, 0.0, 0.0, 0.0
+        for nll_grad, nll_hessian, kl_grad, kl_hessian in zip(nll_grads, nll_hessians, kl_grads, kl_hessians):
             if not nll_grad is None:
                 nll_norm += (nll_grad ** 2).sum()
+            if not nll_hessian is None:
+                nll2_norm += (nll_hessian ** 2).sum()
+            if not kl_grad is None:
+                kl_norm += (kl_grad ** 2).sum()
+            if not kl_hessian is None:
+                kl2_norm += (kl_hessian ** 2).sum()
         nll_norm = nll_norm.sqrt()
+        nll2_norm = nll2_norm.sqrt()
         kl_norm = kl_norm.sqrt()
+        kl2_norm = kl2_norm.sqrt()
 
-        if self._clip_norm > 0 and (nll_norm > self._clip_norm or kl_norm > self._clip_norm):
-            for nll_grad, kl_grad in zip(nll_grads, kl_grads):
-                if not kl_grad is None and kl_norm > self._clip_norm:
-                    kl_grad.mul_( self._clip_norm / (kl_norm + 1e-6) )
+        if self._clip_norm > 0 and (
+            nll_norm > self._clip_norm or nll2_norm > self._clip_norm or \
+            kl_norm > self._clip_norm or kl2_norm > self._clip_norm):
+            for nll_grad, nll_hessian, kl_grad, kl_hessian in zip(
+                nll_grads, nll_hessians, kl_grads, kl_hessians):
                 if not nll_grad is None and nll_norm > self._clip_norm:
                     nll_grad.mul_( self._clip_norm / (nll_norm + 1e-6))
+                if not nll_hessian is None and nll2_norm > self._clip_norm:
+                    nll_hessian.mul_( self._clip_norm / (nll2_norm + 1e-6))
+                if not kl_grad is None and kl_norm > self._clip_norm:
+                    kl_grad.mul_( self._clip_norm / (kl_norm + 1e-6) )
+                if not kl_hessian is None and kl2_norm > self._clip_norm:
+                    kl_hessian.mul_( self._clip_norm / (kl2_norm + 1e-6) )
 
         param_norm = 0.0
         for p in self._model.parameters():
@@ -268,14 +298,18 @@ class TrainerKit(object):
 
         if self._global_step % 100 == 0:
             self._train_writer.add_scalar(
+                "{}/{}".format(self._tensorboard_namespace, "nll_grad_norm"), nll_norm.item(), self._global_step)
+            self._train_writer.add_scalar(
+                "{}/{}".format(self._tensorboard_namespace, "nll_hessian_norm"), nll2_norm.item(), self._global_step)
+            self._train_writer.add_scalar(
                 "{}/{}".format(self._tensorboard_namespace, "kl_grad_norm"), kl_norm.item(), self._global_step)
             self._train_writer.add_scalar(
-                "{}/{}".format(self._tensorboard_namespace, "nll_grad_norm"), nll_norm.item(), self._global_step)
+                "{}/{}".format(self._tensorboard_namespace, "kl_hessian_norm"), kl2_norm.item(), self._global_step)
             self._train_writer.add_scalar(
                 "{}/{}".format(self._tensorboard_namespace, "param_norm"), param_norm.item(), self._global_step)
 
-        self.opt_kl.step(gradients=kl_grads)
-        self.opt_nll.step(gradients=nll_grads, prec_gradients=nll_prec_gradients)
+        self.opt_kl.step2(gradients=kl_grads, prec_gradients=kl_hessians)
+        self.opt_nll.step2(gradients=nll_grads, prec_gradients=nll_hessians)
 
         self.print_progress(val_map)
         self.record_train_scores(val_map)
