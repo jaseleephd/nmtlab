@@ -134,9 +134,8 @@ class TrainerKit(object):
     def configure(self, save_path=None, clip_norm=0,
                   match_gradnorm_iter=-1, kl_annealing=False,
                   minimize_gradnorm_ratio=-1, eps2=0.0,
-                  minimize_grad_ratio=-1,
                   n_valid_per_epoch=10, criteria="loss",
-                  _lambda=0.01,
+                  _lambda=0.01, disable_elbo=False,
                   comp_fn=min, checkpoint_average=0,
                   tensorboard_logdir=None, tensorboard_namespace=None):
         """Configure the hyperparameters of the trainer.
@@ -145,8 +144,8 @@ class TrainerKit(object):
         self._save_path = save_path
         self._clip_norm = clip_norm
         self._minimize_gradnorm_ratio = minimize_gradnorm_ratio
-        self._minimize_grad_ratio = minimize_grad_ratio
         self.eps2 = eps2
+        self._disable_elbo = disable_elbo
         self._match_gradnorm_iter = match_gradnorm_iter
         self._n_valid_per_epoch = n_valid_per_epoch
         self.kl_annealing = kl_annealing
@@ -228,56 +227,53 @@ class TrainerKit(object):
     def train(self, batch):
         vars = self.extract_vars(batch)
 
+        self.opt.zero_grad()
+
         if (self._global_step < self._match_gradnorm_iter) or \
-           (self._global_step < self._minimize_gradnorm_ratio) or \
-           (self._global_step < self._minimize_grad_ratio):
+           (self._global_step < self._minimize_gradnorm_ratio):
             fmodel = higher.patch.monkeypatch(self._model)
-            val_map = fmodel(*vars)
+            if self._current_epoch % 2 == 0:
+                inner_vars = [vars[0][::2], vars[1][::2]]
+            else:
+                inner_vars = [vars[0][1::2], vars[1][1::2]]
 
-            kl_grads = torch.autograd.grad(
-                val_map["kl"], fmodel.init_fast_params, retain_graph=True, create_graph=True, allow_unused=True)
-            nll_grads = torch.autograd.grad(
-                val_map["nll"], fmodel.init_fast_params, allow_unused=True, create_graph=True)
+            val_map = fmodel(*inner_vars)
 
-            nll_norm, kl_norm, grad_ratio_acc = 0.0, 0.0, 0.0
+            kl_grads = torch.autograd.grad(val_map["kl"], fmodel.init_fast_params,
+                                           retain_graph=True, create_graph=True, allow_unused=True)
+            nll_grads = torch.autograd.grad(val_map["nll"], fmodel.init_fast_params,
+                                            allow_unused=True, create_graph=True)
+
+            nll_norm, kl_norm = 0.0, 0.0
             for nll_grad, kl_grad in zip(nll_grads, kl_grads):
                 if not kl_grad is None:
                     kl_norm += (kl_grad ** 2).sum()
                     nll_norm += (nll_grad ** 2).sum()
-                    ratio = torch.max(nll_grad, kl_grad) / ( torch.min(nll_grad, kl_grad) + 1e-6 )
-                    mask = ratio > torch.full_like(ratio, self.eps2)
-                    grad_ratio_acc += (ratio * mask.float()).sum()
 
             if self._global_step < self._match_gradnorm_iter:
-                norm_grad_diff = (nll_norm - kl_norm) ** 2
-                grad_of_grads = torch.autograd.grad(
-                    norm_grad_diff, fmodel.init_fast_params, allow_unused=True)
+                loss_reg = (nll_norm - kl_norm) ** 2
 
             if self._global_step < self._minimize_gradnorm_ratio:
-                norm_grad_ratio = torch.max(nll_norm, kl_norm) / torch.min(nll_norm, kl_norm)
-                grad_of_grads = torch.autograd.grad(
-                    norm_grad_ratio, fmodel.init_fast_params, allow_unused=True)
+                loss_reg = ( torch.log(nll_norm + 1e-6) - torch.log(kl_norm + 1e-6) ) ** 2
+                #loss_reg = (1 - (kl_norm / nll_norm)) ** 2
 
-            if self._global_step < self._minimize_grad_ratio:
-                grad_of_grads = torch.autograd.grad(
-                    grad_ratio_acc, fmodel.init_fast_params, allow_unused=True)
-
-        self.opt.zero_grad()
         val_map = self._model(*vars)
 
         if (self._global_step % 100 == 0):
             kl_grads = torch.autograd.grad(
                 val_map["kl"], self._model.parameters(), retain_graph=True, allow_unused=True)
             nll_grads = torch.autograd.grad(
-                val_map["nll"], self._model.parameters(), allow_unused=True)
+                val_map["nll"], self._model.parameters(), retain_graph=True, allow_unused=True)
 
-            nll_norm, kl_norm, grad_ratio_acc = 0.0, 0.0, 0.0
+            nll_norm, kl_norm = 0.0, 0.0
             for nll_grad, kl_grad in zip(nll_grads, kl_grads):
                 if not kl_grad is None:
                     kl_norm += (kl_grad ** 2).sum()
                     nll_norm += (nll_grad ** 2).sum()
-                    ratio = torch.max(nll_grad, kl_grad) / ( torch.min(nll_grad, kl_grad) + 1e-6 )
-                    grad_ratio_acc += (ratio).sum()
+
+            norm_grad_diff = (nll_norm - kl_norm) ** 2
+            norm_grad_ratio = nll_norm / kl_norm
+            ratio_loss = ( torch.log(nll_norm + 1e-6) - torch.log(kl_norm + 1e-6) ) ** 2
 
             param_norm, enc_norm, other_norm = 0.0, 0.0, 0.0
             for name, param in self._model.named_parameters():
@@ -289,37 +285,34 @@ class TrainerKit(object):
             param_norm, enc_norm, other_norm = \
                     param_norm.sqrt(), enc_norm.sqrt(), other_norm.sqrt()
 
-            norm_grad_diff_ = (nll_norm - kl_norm) ** 2
-            norm_grad_ratio_ = nll_norm / kl_norm
-        else:
-            val_map["loss"].backward()
+        if (self._global_step < self._match_gradnorm_iter) or \
+           (self._global_step < self._minimize_gradnorm_ratio):
+            if self._disable_elbo:
+                val_map["loss"] = loss_reg
+            else:
+                val_map["loss"] += loss_reg * self._lambda
+        val_map["loss"].backward()
 
         if self._global_step % 100 == 0 and self._train_writer is not None:
-            items = [kl_norm, nll_norm, norm_grad_diff_, norm_grad_ratio_, param_norm, enc_norm, other_norm, grad_ratio_acc]
-            names = ["grad_norm_kl", "grad_norm_nll", "grad_norm_diff", "grad_norm_ratio", "param_norm", "enc_norm", "other_norm", "grad_ratio"]
+            items = [kl_norm, nll_norm, norm_grad_diff, norm_grad_ratio, ratio_loss, param_norm, enc_norm, other_norm]
+            names = ["kl_norm", "nll_norm", "norm_grad_diff", "norm_grad_ratio", "ratio_loss", "param_norm", "enc_norm", "other_norm"]
             for item, name in zip(items, names):
                 self._train_writer.add_scalar(
                     "{}/{}".format(self._tensorboard_namespace, name), item.item(), self._global_step)
 
-        if self._global_step % 100 != 0:
-            if (self._global_step < self._match_gradnorm_iter) or \
-               (self._global_step < self._minimize_gradnorm_ratio) or \
-               (self._global_step < self._minimize_grad_ratio):
-                for grad, param in zip(grad_of_grads, self._model.parameters()):
-                    if not (grad is None):
-                        param.grad.data.add_(grad, alpha=self._lambda)
-            if self._clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(self._model.parameters(), self._clip_norm)
-            self.opt.step()
+        if self._clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self._model.parameters(), self._clip_norm)
+        self.opt.step()
 
         self.print_progress(val_map)
         self.record_train_scores(val_map)
-        self._global_step += 1
         if self._global_step % 100 == 0:
             for key, val in val_map.items():
                 if self._train_writer is not None:
                     self._train_writer.add_scalar(
                         "{}/{}".format(self._tensorboard_namespace, key), val.item(), self._global_step)
+
+        self._global_step += 1
 
         return val_map
 
