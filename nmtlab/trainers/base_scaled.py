@@ -15,7 +15,6 @@ from abc import abstractmethod, ABCMeta
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.optim.optimizer import Optimizer
 from torch.autograd import Variable
 from torchtext.data.batch import Batch
@@ -132,8 +131,8 @@ class TrainerKit(object):
             self._model = model
 
     def configure(self, save_path=None, clip_norm=0,
-                  match_gradnorm_iter=-1, kl_annealing=False,
-                  minimize_gradnorm_ratio=-1, eps2=0.0,
+                  match_gradnorm_iter=-1,
+                  minimize_gradnorm_ratio=-1,
                   n_valid_per_epoch=10, criteria="loss",
                   _lambda=0.01, disable_elbo=False,
                   comp_fn=min, checkpoint_average=0,
@@ -144,11 +143,9 @@ class TrainerKit(object):
         self._save_path = save_path
         self._clip_norm = clip_norm
         self._minimize_gradnorm_ratio = minimize_gradnorm_ratio
-        self.eps2 = eps2
         self._disable_elbo = disable_elbo
         self._match_gradnorm_iter = match_gradnorm_iter
         self._n_valid_per_epoch = n_valid_per_epoch
-        self.kl_annealing = kl_annealing
         self._criteria = criteria
         self._comp_fn = comp_fn
         assert self._comp_fn in (min, max)
@@ -232,7 +229,7 @@ class TrainerKit(object):
         if (self._global_step < self._match_gradnorm_iter) or \
            (self._global_step < self._minimize_gradnorm_ratio):
             fmodel = higher.patch.monkeypatch(self._model)
-            if self._current_epoch % 2 == 0:
+            if self._current_epoch % 2 == 0: # halve batch to avoid OOM error
                 inner_vars = [vars[0][::2], vars[1][::2]]
             else:
                 inner_vars = [vars[0][1::2], vars[1][1::2]]
@@ -273,15 +270,14 @@ class TrainerKit(object):
 
             norm_grad_diff = (nll_norm - kl_norm) ** 2
             norm_grad_ratio = nll_norm / kl_norm
-            ratio_loss = ( torch.log(nll_norm + 1e-6) - torch.log(kl_norm + 1e-6) ) ** 2
 
-            param_norm, enc_norm, other_norm = 0.0, 0.0, 0.0
+            enc_norm, other_norm = 0.0, 0.0
             for name, param in self._model.named_parameters():
-                param_norm += (param.data ** 2).sum()
                 if any([name.startswith(xx) for xx in self.enc_param_names]):
                     enc_norm += (param.data ** 2).sum()
                 else:
                     other_norm += (param.data ** 2).sum()
+            param_norm = enc_norm + other_norm
             param_norm, enc_norm, other_norm = \
                     param_norm.sqrt(), enc_norm.sqrt(), other_norm.sqrt()
 
@@ -294,8 +290,8 @@ class TrainerKit(object):
         val_map["loss"].backward()
 
         if self._global_step % 100 == 0 and self._train_writer is not None:
-            items = [kl_norm, nll_norm, norm_grad_diff, norm_grad_ratio, ratio_loss, param_norm, enc_norm, other_norm]
-            names = ["kl_norm", "nll_norm", "norm_grad_diff", "norm_grad_ratio", "ratio_loss", "param_norm", "enc_norm", "other_norm"]
+            items = [kl_norm, nll_norm, norm_grad_diff, norm_grad_ratio, param_norm, enc_norm, other_norm]
+            names = ["kl_norm", "nll_norm", "norm_grad_diff", "norm_grad_ratio", "param_norm", "enc_norm", "other_norm"]
             for item, name in zip(items, names):
                 self._train_writer.add_scalar(
                     "{}/{}".format(self._tensorboard_namespace, name), item.item(), self._global_step)
