@@ -35,7 +35,7 @@ class TrainerKit(object):
 
     __metaclass__ = ABCMeta
 
-    def __init__(self, model, dataset, opt, scheduler=None, multigpu=False, using_horovod=True):
+    def __init__(self, model, dataset, optimizer, scheduler=None, multigpu=False, using_horovod=True):
         """Create a trainer.
         Args:
             model (EncoderDecoderModel): The model to train.
@@ -43,11 +43,9 @@ class TrainerKit(object):
             scheduler (Scheduler): Training scheduler.
         """
         self.enc_param_names = ["embed_layer", "x_encoder", "q_encoder", "q_hid2lat"]
-        self.kl_grad, self.nll_grad, self.total_grad, self.param_norm = {}, {}, {}, {}
         self._model = model
         self._dataset = dataset
-        self.opt = opt
-        self._optimizer  = self.opt
+        self._optimizer = optimizer
         self._scheduler = scheduler if scheduler is not None else Scheduler()
         self._multigpu = multigpu
         self._horovod = using_horovod
@@ -130,21 +128,17 @@ class TrainerKit(object):
         else:
             self._model = model
 
-    def configure(self, save_path=None, clip_norm=0,
-                  match_gradnorm_iter=-1,
-                  minimize_gradnorm_ratio=-1,
-                  n_valid_per_epoch=10, criteria="loss",
-                  _lambda=0.01, disable_elbo=False,
+    def configure(self, save_path=None, clip_norm=0, n_valid_per_epoch=10, criteria="loss",
+                  pretrain_iter=-1, jointtrain_iter=-1, _lambda=0.01,
                   comp_fn=min, checkpoint_average=0,
                   tensorboard_logdir=None, tensorboard_namespace=None):
         """Configure the hyperparameters of the trainer.
         """
-        self._lambda = _lambda
         self._save_path = save_path
         self._clip_norm = clip_norm
-        self._minimize_gradnorm_ratio = minimize_gradnorm_ratio
-        self._disable_elbo = disable_elbo
-        self._match_gradnorm_iter = match_gradnorm_iter
+        self._pretrain_iter = pretrain_iter
+        self._jointtrain_iter = jointtrain_iter
+        self._lambda = _lambda
         self._n_valid_per_epoch = n_valid_per_epoch
         self._criteria = criteria
         self._comp_fn = comp_fn
@@ -196,109 +190,74 @@ class TrainerKit(object):
             vars = [var.cuda() if isinstance(var, torch.Tensor) else var for var in vars]
         return vars
 
-    def get_grads(self):
-        dot_product = torch.sum(
-            torch.stack([(kl * nll).sum() for kl, nll in zip(
-                self.kl_grad.values(), self.nll_grad.values())
-            ])
-        )
-
-        kl = torch.sum(
-            torch.stack([(ep ** 2).sum() for ep in self.kl_grad.values()])
-        ).sqrt()
-
-        nll = torch.sum(
-            torch.stack([(ep ** 2).sum() for ep in self.nll_grad.values()])
-        ).sqrt()
-
-        cosine = dot_product / (kl * nll)
-
-        diff = (kl - nll) ** 2
-
-        param = torch.sum(
-            torch.stack([(ep ** 2).sum() for ep in self.param_norm.values()])
-        ).sqrt()
-
-        return kl.item(), nll.item(), diff.item(), param.item(), cosine.item()
-
     def train(self, batch):
         vars = self.extract_vars(batch)
+        self._optimizer.zero_grad()
 
-        self.opt.zero_grad()
-
-        if (self._global_step < self._match_gradnorm_iter) or \
-           (self._global_step < self._minimize_gradnorm_ratio):
+        if self._global_step < self._pretrain_iter or self._global_step < self._jointtrain_iter:
             fmodel = higher.patch.monkeypatch(self._model)
             if self._current_epoch % 2 == 0: # halve batch to avoid OOM error
                 inner_vars = [vars[0][::2], vars[1][::2]]
             else:
                 inner_vars = [vars[0][1::2], vars[1][1::2]]
+            inner_val_map = fmodel(*inner_vars)
 
-            val_map = fmodel(*inner_vars)
-
-            kl_grads = torch.autograd.grad(val_map["kl"], fmodel.init_fast_params,
-                                           retain_graph=True, create_graph=True, allow_unused=True)
-            nll_grads = torch.autograd.grad(val_map["nll"], fmodel.init_fast_params,
-                                            allow_unused=True, create_graph=True)
+            kl_grads = torch.autograd.grad(
+                inner_val_map["kl"], fmodel.init_fast_params, retain_graph=True, create_graph=True, allow_unused=True)
+            nll_grads = torch.autograd.grad(
+                inner_val_map["nll"], fmodel.init_fast_params, allow_unused=True, create_graph=True)
 
             nll_norm, kl_norm = 0.0, 0.0
             for nll_grad, kl_grad in zip(nll_grads, kl_grads):
                 if not kl_grad is None:
                     kl_norm += (kl_grad ** 2).sum()
                     nll_norm += (nll_grad ** 2).sum()
-
-            if self._global_step < self._match_gradnorm_iter:
-                loss_reg = (nll_norm - kl_norm) ** 2
-
-            if self._global_step < self._minimize_gradnorm_ratio:
-                loss_reg = ( torch.log(nll_norm + 1e-6) - torch.log(kl_norm + 1e-6) ) ** 2
-                #loss_reg = (1 - (kl_norm / nll_norm)) ** 2
+            loss_reg = (nll_norm - kl_norm) ** 2
+            inner_val_map = None
 
         val_map = self._model(*vars)
-
         if (self._global_step % 100 == 0):
-            kl_grads = torch.autograd.grad(
-                val_map["kl"], self._model.parameters(), retain_graph=True, allow_unused=True)
-            nll_grads = torch.autograd.grad(
-                val_map["nll"], self._model.parameters(), retain_graph=True, allow_unused=True)
+            with torch.no_grad():
+                kl_grads = torch.autograd.grad(
+                    val_map["kl_token"], self._model.parameters(), retain_graph=True, allow_unused=True)
+                nll_grads = torch.autograd.grad(
+                    val_map["nll_token"], self._model.parameters(), retain_graph=True, allow_unused=True)
 
-            nll_norm, kl_norm = 0.0, 0.0
-            for nll_grad, kl_grad in zip(nll_grads, kl_grads):
-                if not kl_grad is None:
-                    kl_norm += (kl_grad ** 2).sum()
-                    nll_norm += (nll_grad ** 2).sum()
+                nll_norm, kl_norm = 0.0, 0.0
+                for nll_grad, kl_grad in zip(nll_grads, kl_grads):
+                    if not kl_grad is None:
+                        kl_norm += (kl_grad ** 2).sum()
+                        nll_norm += (nll_grad ** 2).sum()
 
-            norm_grad_diff = (nll_norm - kl_norm) ** 2
-            norm_grad_ratio = nll_norm / kl_norm
+                norm_grad_diff = (nll_norm - kl_norm) ** 2
+                norm_grad_ratio = nll_norm / kl_norm
 
-            enc_norm, other_norm = 0.0, 0.0
-            for name, param in self._model.named_parameters():
-                if any([name.startswith(xx) for xx in self.enc_param_names]):
-                    enc_norm += (param.data ** 2).sum()
-                else:
-                    other_norm += (param.data ** 2).sum()
-            param_norm = enc_norm + other_norm
-            param_norm, enc_norm, other_norm = \
-                    param_norm.sqrt(), enc_norm.sqrt(), other_norm.sqrt()
+                enc_norm, other_norm = 0.0, 0.0
+                for param, kl_grad in zip(self._model.parameters(), kl_grads):
+                    if not kl_grad is None:
+                        enc_norm += (param.data ** 2).sum()
+                    else:
+                        other_norm += (param.data ** 2).sum()
+                param_norm = enc_norm + other_norm
+                param_norm, enc_norm, other_norm = \
+                        param_norm.sqrt(), enc_norm.sqrt(), other_norm.sqrt()
 
-        if (self._global_step < self._match_gradnorm_iter) or \
-           (self._global_step < self._minimize_gradnorm_ratio):
-            if self._disable_elbo:
-                val_map["loss"] = loss_reg
-            else:
-                val_map["loss"] += loss_reg * self._lambda
+        if self._global_step < self._pretrain_iter:
+            val_map["loss"] = loss_reg
+        elif self._global_step < self._jointtrain_iter:
+            val_map["loss"] += loss_reg * self._lambda
         val_map["loss"].backward()
 
         if self._global_step % 100 == 0 and self._train_writer is not None:
             items = [kl_norm, nll_norm, norm_grad_diff, norm_grad_ratio, param_norm, enc_norm, other_norm]
-            names = ["kl_norm", "nll_norm", "norm_grad_diff", "norm_grad_ratio", "param_norm", "enc_norm", "other_norm"]
+            names = ["kl_norm", "nll_norm", "norm_grad_diff", "norm_grad_ratio", "all_param_norm", "enc_param_norm", "other_param_norm"]
             for item, name in zip(items, names):
                 self._train_writer.add_scalar(
                     "{}/{}".format(self._tensorboard_namespace, name), item.item(), self._global_step)
 
         if self._clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(self._model.parameters(), self._clip_norm)
-        self.opt.step()
+        self._optimizer.step()
 
         self.print_progress(val_map)
         self.record_train_scores(val_map)
@@ -426,7 +385,7 @@ class TrainerKit(object):
             "step": self._current_step,
             "global_step": self._global_step,
             "model_state": self._model.state_dict(),
-            "opt_state": self.opt.state_dict(),
+            "opt_state": self._optimizer.state_dict(),
             "leanring_rate": self.learning_rate()
         }
         if path is None:
@@ -442,7 +401,7 @@ class TrainerKit(object):
         device_str = str(first_param.device)
         state_dict = torch.load(path, map_location=device_str)
         self._model.load_state_dict(state_dict["model_state"])
-        self.opt.load_state_dict(state_dict["opt_state"])
+        self._optimizer.load_state_dict(state_dict["opt_state"])
         self._current_step = state_dict["step"]
         self._current_epoch = state_dict["epoch"]
         if "global_step" in state_dict:
@@ -465,7 +424,7 @@ class TrainerKit(object):
             return is_finished
     
     def learning_rate(self):
-        return self.opt.param_groups[0]["lr"]
+        return self._optimizer.param_groups[0]["lr"]
     
     def synchronize_learning_rate(self):
         """Synchronize learning rate over all devices.
@@ -479,7 +438,7 @@ class TrainerKit(object):
                 self.set_learning_rate(new_lr, silent=True)
         
     def set_learning_rate(self, lr, silent=False):
-        for g in self.opt.param_groups:
+        for g in self._optimizer.param_groups:
             g["lr"] = lr
         if self._is_root_node() and not silent:
             self.log("nmtlab", "change learning rate to {:.6f}".format(lr))
